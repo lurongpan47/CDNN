@@ -1,0 +1,8 @@
+# Core requirements for the NumPy CDLinear library and MNIST experiment.
+# For the PyTorch training pipelines, see:
+#   cdnn_a100_training/requirements.txt   (8x A100 / Ampere)
+#   cdnn_h800_training/requirements.txt   (8x H800 / Hopper, FP8)
+
+numpy>=1.23.0
+scikit-learn>=1.1.0
+matplotlib>=3.6.0

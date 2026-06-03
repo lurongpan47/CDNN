@@ -1,0 +1,37 @@
+{
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "epochs": 25,
+  "by_model": {
+    "Dense": {
+      "params": 8970,
+      "final_loss_mean": 0.0010607835214113917,
+      "final_loss_std": 0.00012615152144729265,
+      "final_acc_mean": 0.9814814814814815,
+      "final_acc_std": 0.004721314364437784,
+      "cond_mean": 5944957.018381405,
+      "cond_std": 4151829.978330049
+    },
+    "CD_block4": {
+      "params": 2380,
+      "final_loss_mean": 0.0006857155739060967,
+      "final_loss_std": 0.0001637074151100197,
+      "final_acc_mean": 0.975,
+      "final_acc_std": 0.0022680460581325644,
+      "cond_mean": 18782.376400626334,
+      "cond_std": 14085.616173998887
+    },
+    "CD_block8": {
+      "params": 1296,
+      "final_loss_mean": 0.015695622774471365,
+      "final_loss_std": 0.01650235033344071,
+      "final_acc_mean": 0.9638888888888889,
+      "final_acc_std": 0.011340230290662867,
+      "cond_mean": 509.554895934022,
+      "cond_std": 365.67564096201386
+    }
+  }
+}

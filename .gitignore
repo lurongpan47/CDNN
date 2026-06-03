@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Training artifacts
+checkpoints/
+runs/
+wandb/
+data/
+*.bin
+meta.json
+training.log
+launch_config.json
+
+# LaTeX build artifacts
+paper/main.aux
+paper/main.log
+paper/main.out
+paper/main.toc
+paper/main.bbl
+paper/main.blg
+paper/main.fls
+paper/main.fdb_latexmk
+paper/main.synctex.gz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sandbox / temp
+*.tmp
+*.bak
+.ipynb_checkpoints/

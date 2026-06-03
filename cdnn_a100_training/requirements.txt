@@ -1,0 +1,38 @@
+# =============================================================================
+# CD-Transformer A100 Training — Python Dependencies
+# =============================================================================
+# Tested with Python 3.10–3.12 on NVIDIA A100 (CUDA 11.8 / 12.x).
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# For CUDA 11.8 builds of PyTorch, install torch separately first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+#   pip install -r requirements.txt
+# =============================================================================
+
+# --- Core (required) ---
+# PyTorch 2.0+ is required for:
+#   - F.scaled_dot_product_attention (Flash Attention v2 on A100)
+#   - FSDP with use_orig_params
+#   - fused AdamW
+torch>=2.0.0
+numpy>=1.23.0
+
+# --- Data preparation (OPTIONAL) ---
+# Only needed for non-byte tokenizers in prepare_data.py.
+#   - Nothing here is required if you use:  --tokenizer byte   (fully offline)
+#     or  --source synthetic  (no tokenizer at all).
+#   - modelscope: DeepSeek/Qwen tokenizers from ModelScope (魔搭). RECOMMENDED
+#     in mainland China — its servers are reachable without a VPN.
+#       --tokenizer deepseek   (deepseek-ai/DeepSeek-V2)
+#   - transformers: needed alongside modelscope, and for HuggingFace ids.
+#     prepare_data.py defaults HF_ENDPOINT to https://hf-mirror.com for China.
+#   - tiktoken: GPT-2/GPT-4 BPE (caches vocab locally after first download).
+modelscope>=1.9.0
+transformers>=4.30.0
+tiktoken>=0.4.0
+datasets>=2.10.0
+
+# --- Utilities ---
+tqdm>=4.65.0
