@@ -36,12 +36,12 @@ NUM_NODES=1
 # Training hyperparameters (DeepSeek-V3 aligned)
 case "$MODEL_SIZE" in
     small)
-        BATCH_SIZE=16
-        GRAD_ACCUM=2
-        LR=6e-4
-        WARMUP=1000
-        EPOCHS=20
-        SEQ_LEN=2048
+        BATCH_SIZE=${BATCH_SIZE:-16}
+        GRAD_ACCUM=${GRAD_ACCUM:-2}
+        LR=${LR:-6e-4}
+        WARMUP=${WARMUP:-1000}
+        EPOCHS=${EPOCHS:-20}
+        SEQ_LEN=${SEQ_LEN:-2048}
         ;;
     medium)
         BATCH_SIZE=8
@@ -65,6 +65,25 @@ case "$MODEL_SIZE" in
         ;;
 esac
 
+# --- Fisher regularizer ----------------------------------------------------
+# mode "energy"      : L2-like (controls weight scale only); lambda ~1e-8
+# mode "conditioning": flattens the CD spectrum, drives kappa -> 1 (Theorem 2);
+#                      USE THIS to fix the kappa~1e10 / exploding-GradNorm issue.
+#                      lambda is on a different scale here (~1e-2 .. 1e-1).
+FISHER_MODE=${FISHER_MODE:-energy}
+if [ "$FISHER_MODE" = "conditioning" ]; then
+    FISHER_LAMBDA=${FISHER_LAMBDA:-0.02}
+else
+    FISHER_LAMBDA=${FISHER_LAMBDA:-1e-8}
+fi
+# conditioning aggregation over blocks: mean | pnorm | max (pnorm/max target the
+# worst blocks so a few catastrophic ones aren't diluted by the well-conditioned majority)
+FISHER_AGG=${FISHER_AGG:-mean}
+# warmup as a fraction of total steps (robust across dataset sizes); empty -> use WARMUP
+WARMUP_FRAC=${WARMUP_FRAC:-}
+# DENSE=1 trains the non-circulant baseline (same architecture & schedule)
+DENSE=${DENSE:-0}
+
 EFFECTIVE_BATCH=$((BATCH_SIZE * NUM_GPUS * GRAD_ACCUM))
 
 echo "============================================================"
@@ -87,12 +106,25 @@ echo "============================================================"
 # Environment setup for H800
 # ---------------------------------------------------------------------------
 
-# NCCL optimizations for H800 NVLink
-export NCCL_IB_DISABLE=0
-export NCCL_NET_GDR_LEVEL=2
-export NCCL_P2P_LEVEL=NVL           # NVLink peer-to-peer
+# NCCL optimizations for H800 NVLink (single node, intra-node NVLink only)
+#
+# This is a SINGLE-NODE job (NUM_NODES=1): all 8 GPUs talk over NVLink/PCIe,
+# so InfiniBand is not used. We intentionally do NOT force NCCL_IB_DISABLE=0
+# or pin NCCL_SOCKET_IFNAME=eth0 — on many China-hosted H800 boxes the RDMA
+# NIC is absent/misconfigured and the host interface is not named "eth0",
+# which makes NCCL hang at init. Let NCCL auto-detect instead.
+export NCCL_P2P_LEVEL=NVL           # prefer NVLink for peer-to-peer
+export NCCL_P2P_DISABLE=0
 export NCCL_SHM_DISABLE=0
-export NCCL_SOCKET_IFNAME=eth0
+# Disable IB for this single-node run (no inter-node traffic). Comment out
+# the next line for multi-node runs and set NCCL_SOCKET_IFNAME to your NIC.
+export NCCL_IB_DISABLE=1
+# If you DO have a working IB fabric and want GDR, instead set:
+#   export NCCL_IB_DISABLE=0
+#   export NCCL_NET_GDR_LEVEL=2
+#   export NCCL_SOCKET_IFNAME=<your_iface>   # e.g. bond0 / ens / eth0
+# Uncomment for verbose init logs when debugging a hang:
+# export NCCL_DEBUG=INFO
 
 # CUDA settings
 export CUDA_DEVICE_MAX_CONNECTIONS=1  # Overlap compute and communication
@@ -160,7 +192,11 @@ torchrun \
     --use_fp8 \
     --use_amp \
     --grad_checkpoint \
-    --fisher_lambda 1e-5 \
+    --fisher_lambda $FISHER_LAMBDA \
+    --fisher_mode $FISHER_MODE \
+    --fisher_agg $FISHER_AGG \
+    ${WARMUP_FRAC:+--warmup_frac $WARMUP_FRAC} \
+    $([ "$DENSE" = "1" ] && echo --dense) \
     --log_interval 50 \
     $USE_SYNTHETIC \
     2>&1 | tee "${SAVE_DIR}/training.log"

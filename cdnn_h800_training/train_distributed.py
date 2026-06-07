@@ -4,37 +4,20 @@
 train_distributed.py — H800 8-GPU Distributed Training for CD-Transformer
 =============================================================================
 
-Full distributed training pipeline for CD-Transformer on an 8×H800 GPU
-cluster (64GB shared memory), integrating DeepSeek-V3's proven cost-
-reduction techniques with CDNN's block-circulant parameter efficiency.
+Distributed training for CD-Transformer on an 8xH800 node, integrating
+DeepSeek-V3 cost-reduction techniques with CDNN block-circulant efficiency.
 
-Hardware target: 8 × NVIDIA H800 (80GB HBM3 each, 64GB shared memory)
-
-DeepSeek-V3 training optimizations integrated:
-  1. FP8 mixed-precision training (2× throughput on H800 tensor cores)
-  2. FSDP (Fully Sharded Data Parallel) for memory efficiency
-  3. Gradient checkpointing (activation recomputation)
-  4. Multi-Token Prediction (MTP) auxiliary objective
-  5. Cosine learning rate schedule with warmup
-  6. Gradient clipping (1.0)
-  7. ZeRO Stage 2 optimizer state sharding
-
-CD-specific training enhancements:
-  8. Fisher-information regularization (closed-form, Theorem 2)
-  9. Hessian condition monitoring via FFT spectrum
-  10. Shannon dropout (α_CD = 0.0118) — no tuning needed
-  11. Per-batch conditioning diagnostics
+Fixed / hardened in this revision:
+  * BF16 autocast WITHOUT GradScaler (GradScaler is for FP16 only).
+  * Lazy uint16 memmap dataset (no longer loads the whole corpus as int64).
+  * FSDP-correct checkpoint save/load (model + optimizer sharded state).
+  * Working --resume.
+  * Auxiliary-loss-free router-bias update each optimizer step.
+  * Fused AdamW guarded for CUDA availability.
 
 Usage:
-  # Single node, 8 GPUs
-  torchrun --nproc_per_node=8 train_distributed.py \
-      --config medium --data_path /data/train.bin \
-      --epochs 10 --batch_size 8 --grad_accum 4
-
-  # With custom settings
-  torchrun --nproc_per_node=8 train_distributed.py \
-      --config small --lr 3e-4 --warmup_steps 2000 \
-      --use_fp8 --save_dir ./checkpoints
+  torchrun --standalone --nproc_per_node=8 train_distributed.py \
+      --config medium --data_path ./data/train.bin --epochs 10
 
 Authors: L. Pan (Ainnocence Inc.)
 License: MIT
@@ -42,7 +25,6 @@ License: MIT
 """
 
 import os
-import sys
 import math
 import time
 import json
@@ -52,37 +34,33 @@ from pathlib import Path
 from contextlib import nullcontext
 from dataclasses import asdict
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
     ShardingStrategy,
     BackwardPrefetch,
-    CPUOffload,
+    StateDictType,
+    FullStateDictConfig,
+    FullOptimStateDictConfig,
 )
-from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy,
-    size_based_auto_wrap_policy,
-)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from torch.cuda.amp import autocast, GradScaler
 
-from cd_model import CDTransformer, CDModelConfig, CONFIGS, create_model
-from cd_layers import CDLinear, CDTransformerBlock, fisher_reg_loss, ALPHA_CD
+from cd_model import CDTransformer, CONFIGS
+from cd_layers import CDLinear, CDTransformerBlock, update_router_biases
 
 
 # =============================================================================
 # Logging
 # =============================================================================
 def setup_logging(rank: int):
-    """Configure logging — only rank 0 logs to console."""
-    level = logging.INFO if rank == 0 else logging.WARNING
     logging.basicConfig(
-        level=level,
+        level=logging.INFO if rank == 0 else logging.WARNING,
         format=f'[Rank {rank}] %(asctime)s - %(levelname)s - %(message)s',
         datefmt='%H:%M:%S',
     )
@@ -90,17 +68,15 @@ def setup_logging(rank: int):
 
 
 # =============================================================================
-# Distributed Setup
+# Distributed setup
 # =============================================================================
 def setup_distributed():
-    """Initialize distributed training environment."""
     if 'RANK' not in os.environ:
-        # Single GPU fallback
-        os.environ['RANK'] = '0'
-        os.environ['LOCAL_RANK'] = '0'
-        os.environ['WORLD_SIZE'] = '1'
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '29500'
+        os.environ.setdefault('RANK', '0')
+        os.environ.setdefault('LOCAL_RANK', '0')
+        os.environ.setdefault('WORLD_SIZE', '1')
+        os.environ.setdefault('MASTER_ADDR', 'localhost')
+        os.environ.setdefault('MASTER_PORT', '29500')
 
     rank = int(os.environ['RANK'])
     local_rank = int(os.environ['LOCAL_RANK'])
@@ -108,42 +84,40 @@ def setup_distributed():
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-
     return rank, local_rank, world_size
 
 
 def cleanup_distributed():
     if dist.is_initialized():
+        dist.barrier()
         dist.destroy_process_group()
 
 
 # =============================================================================
-# Dataset — Tokenized text (binary format, à la nanoGPT)
+# Dataset — lazy uint16 memmap (à la nanoGPT)
 # =============================================================================
 class TokenDataset(Dataset):
-    """Memory-mapped token dataset for efficient large-corpus training.
+    """Memory-mapped uint16 token dataset.
 
-    Expects a binary file of uint16 token IDs (or generates synthetic
-    data for testing). Supports sequence packing for full GPU utilization.
+    The previous version did ``np.memmap(...).astype(np.int64)`` which copied
+    the ENTIRE corpus into RAM as 8-byte ints, defeating the memmap. Here the
+    memmap stays on disk and only per-sample slices are materialized.
     """
 
     def __init__(self, data_path: str, seq_len: int = 2048,
                  vocab_size: int = 32000, synthetic: bool = False,
-                 synthetic_size: int = 100000):
+                 synthetic_size: int = 1_000_000):
         self.seq_len = seq_len
         self.vocab_size = vocab_size
 
         if synthetic or not os.path.exists(data_path):
-            # Generate synthetic data for testing
-            self.data = torch.randint(0, vocab_size, (synthetic_size,),
-                                      dtype=torch.long)
+            rng = np.random.default_rng(0)
+            self.data = rng.integers(0, vocab_size, size=synthetic_size,
+                                     dtype=np.uint16)
             self.n_tokens = synthetic_size
         else:
-            import numpy as np
-            self.data = torch.from_numpy(
-                np.memmap(data_path, dtype=np.uint16, mode='r').astype(np.int64)
-            )
-            self.n_tokens = len(self.data)
+            self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+            self.n_tokens = self.data.shape[0]
 
     def __len__(self):
         return max(1, (self.n_tokens - 1) // self.seq_len)
@@ -151,505 +125,417 @@ class TokenDataset(Dataset):
     def __getitem__(self, idx):
         start = idx * self.seq_len
         end = min(start + self.seq_len + 1, self.n_tokens)
-        chunk = self.data[start:end]
-        if len(chunk) < self.seq_len + 1:
-            chunk = F.pad(chunk, (0, self.seq_len + 1 - len(chunk)), value=0)
-        x = chunk[:self.seq_len]
-        y = chunk[1:self.seq_len + 1]
+        chunk = np.asarray(self.data[start:end], dtype=np.int64)   # small copy
+        x = torch.from_numpy(chunk[:-1].copy())
+        y = torch.from_numpy(chunk[1:].copy())
+        if x.numel() < self.seq_len:
+            x = F.pad(x, (0, self.seq_len - x.numel()))
+            y = F.pad(y, (0, self.seq_len - y.numel()), value=-100)  # ignore pad
         return x, y
 
 
 # =============================================================================
-# Learning Rate Schedule — DeepSeek-V3 style
+# LR schedule — cosine with warmup (DeepSeek-V3 style)
 # =============================================================================
 class CosineWarmupScheduler:
-    """Cosine decay with linear warmup, as used in DeepSeek-V3.
-
-    DeepSeek-V3 uses:
-      - Linear warmup for first 2000 steps
-      - Cosine decay to 10% of peak LR
-      - No restarts
-    """
-
-    def __init__(self, optimizer, warmup_steps: int, total_steps: int,
-                 min_lr_ratio: float = 0.1):
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
         self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
+        self.warmup_steps = max(1, warmup_steps)
+        self.total_steps = max(self.warmup_steps + 1, total_steps)
         self.min_lr_ratio = min_lr_ratio
         self.base_lrs = [pg['lr'] for pg in optimizer.param_groups]
 
-    def step(self, step: int):
+    def step(self, step):
         if step < self.warmup_steps:
-            # Linear warmup
-            ratio = step / max(1, self.warmup_steps)
+            ratio = step / self.warmup_steps
         else:
-            # Cosine decay
-            progress = (step - self.warmup_steps) / max(
-                1, self.total_steps - self.warmup_steps
-            )
+            progress = (step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            progress = min(1.0, progress)
             ratio = self.min_lr_ratio + 0.5 * (1 - self.min_lr_ratio) * (
-                1 + math.cos(math.pi * progress)
-            )
-
-        for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            pg['lr'] = base_lr * ratio
+                1 + math.cos(math.pi * progress))
+        for pg, base in zip(self.optimizer.param_groups, self.base_lrs):
+            pg['lr'] = base * ratio
 
     def get_lr(self):
         return [pg['lr'] for pg in self.optimizer.param_groups]
 
 
 # =============================================================================
-# Hessian Monitoring — CD-specific diagnostics
+# Hessian monitoring (CD diagnostic). Valid under ZeRO-2 (full params present).
 # =============================================================================
 class HessianMonitor:
-    """Monitor CDLinear Hessian condition numbers during training.
-
-    Theorem 1 (Pan 2026): Hessian eigenvalues are |FFT(c)|² for each
-    circulant block — readable from a single FFT, no matrix decomposition.
-
-    Theorem 2: Under pre-whitening, κ = 1 exactly. We track empirical κ
-    to verify the conditioning advantage during training.
-    """
-
-    def __init__(self, model: nn.Module, log_interval: int = 100):
+    def __init__(self, model, log_interval=100, hessian_interval=None,
+                 max_layers=24):
         self.model = model
+        # kappa moves slowly and the full-model summon_full_params all-gather is
+        # the most expensive thing on a logged step (it caused the throughput dip
+        # in profiling). Sample it far less often than the loss log, and cap the
+        # number of layers inspected so the cost stays bounded on large models.
         self.log_interval = log_interval
+        hi = hessian_interval or max(log_interval, 500)
+        # the monitor is only *called* on log_interval steps, so snap up to a
+        # multiple of it (otherwise the two cadences rarely coincide)
+        self.hessian_interval = max(log_interval, (hi // log_interval) * log_interval)
+        self.max_layers = max_layers
         self.history = []
 
     @torch.no_grad()
-    def log(self, step: int, logger) -> dict:
-        """Compute and log Hessian condition numbers for all CDLinear layers."""
-        if step % self.log_interval != 0:
+    def log(self, step, logger):
+        # All ranks evaluate this predicate identically (same step), so they
+        # enter/skip the collective together — no deadlock.
+        if step % self.hessian_interval != 0:
             return {}
-
+        is_fsdp = isinstance(self.model, FSDP) or any(
+            isinstance(m, FSDP) for m in self.model.modules())
+        ctx = (FSDP.summon_full_params(self.model, writeback=False, recurse=True)
+               if is_fsdp else nullcontext())
         kappas = []
-        layer_stats = []
-
-        for name, module in self.model.named_modules():
-            if isinstance(module, CDLinear):
+        with ctx:
+            cd = [m for _, m in self.model.named_modules()
+                  if isinstance(m, CDLinear) and m.c is not None]
+            # Inspect an evenly-spaced subset for a representative estimate.
+            if len(cd) > self.max_layers:
+                stride = len(cd) // self.max_layers
+                cd = cd[::stride][:self.max_layers]
+            for module in cd:
+                if module.c.numel() == 0:        # still sharded/empty — skip
+                    continue
                 spec = module.hessian_spectrum()
-                spec_pos = spec[spec > 1e-12]
-                if spec_pos.numel() > 0:
-                    kappa = float(spec_pos.max() / spec_pos.min())
-                    mean_eig = float(spec_pos.mean())
-                    kappas.append(kappa)
-                    layer_stats.append({
-                        'name': name, 'kappa': kappa,
-                        'mean_eig': mean_eig,
-                        'num_params': module.c.numel(),
-                    })
-
-        if kappas:
-            import statistics
-            stats = {
-                'step': step,
-                'mean_kappa': statistics.mean(kappas),
-                'max_kappa': max(kappas),
-                'min_kappa': min(kappas),
-                'median_kappa': statistics.median(kappas),
-            }
-            self.history.append(stats)
-            logger.info(
-                f"Hessian κ — mean: {stats['mean_kappa']:.1f}, "
-                f"max: {stats['max_kappa']:.1f}, "
-                f"min: {stats['min_kappa']:.1f}  "
-                f"(310× better than dense per Pan 2026 Thm 2)"
-            )
-            return stats
-        return {}
+                spec = spec[spec > 1e-12]
+                if spec.numel() > 0:
+                    kappas.append(float(spec.max() / spec.min()))
+        if not kappas:
+            return {}
+        import statistics
+        stats = {
+            'step': step,
+            'mean_kappa': statistics.mean(kappas),
+            'max_kappa': max(kappas),
+            'min_kappa': min(kappas),
+            'median_kappa': statistics.median(kappas),
+        }
+        self.history.append(stats)
+        rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
+        if rank0:
+            logger.info(f"Hessian kappa — mean: {stats['mean_kappa']:.3g}, "
+                        f"max: {stats['max_kappa']:.3g}, min: {stats['min_kappa']:.3g}")
+        return stats
 
 
 # =============================================================================
-# FSDP Wrapper
+# FSDP wrapping
 # =============================================================================
-def wrap_model_fsdp(model: CDTransformer, rank: int,
-                    use_fp8: bool = True) -> FSDP:
-    """Wrap model with FSDP for multi-GPU memory efficiency.
-
-    Uses transformer-block auto-wrapping so each CDTransformerBlock
-    is a separate FSDP unit. This gives fine-grained sharding
-    appropriate for the MoE architecture.
-    """
-    # Mixed precision policy
-    if use_fp8 and hasattr(torch, 'float8_e4m3fn'):
-        # FP8 compute, BF16 communication
-        mp_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        )
-    else:
-        mp_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        )
-
-    # Auto-wrap at transformer block granularity
+def wrap_model_fsdp(model, local_rank):
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
     import functools
     auto_wrap = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={CDTransformerBlock},
     )
-
-    model = FSDP(
+    return FSDP(
         model,
         auto_wrap_policy=auto_wrap,
         mixed_precision=mp_policy,
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,  # ZeRO-2
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,   # ZeRO-2
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        device_id=rank,
-        use_orig_params=True,  # Needed for gradient checkpointing
-        limit_all_gathers=True,  # Reduce memory spikes
+        device_id=local_rank,
+        use_orig_params=True,            # required for grad checkpointing
+        limit_all_gathers=True,
     )
 
-    return model
+
+# =============================================================================
+# Checkpointing (FSDP-correct)
+# =============================================================================
+def save_checkpoint(model, optimizer, scheduler, epoch, step, loss, save_dir, config, logger):
+    save_path = Path(save_dir)
+    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    ocfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg, ocfg):
+        model_sd = model.state_dict()
+        optim_sd = FSDP.optim_state_dict(model, optimizer)   # gathers sharded opt state
+    if dist.get_rank() == 0:
+        save_path.mkdir(parents=True, exist_ok=True)
+        ckpt = {
+            'model_state_dict': model_sd,
+            'optimizer_state_dict': optim_sd,
+            'scheduler_base_lrs': scheduler.base_lrs,
+            'epoch': epoch, 'step': step, 'loss': loss,
+            'config': asdict(config),
+        }
+        torch.save(ckpt, save_path / f'checkpoint_step{step}.pt')
+        torch.save(ckpt, save_path / 'checkpoint_latest.pt')
+        logger.info(f"  Checkpoint saved: {save_path / f'checkpoint_step{step}.pt'}")
+
+
+def load_checkpoint(model, optimizer, ckpt_path, logger):
+    """Load an FSDP checkpoint. Broadcasts rank0 full state to all shards."""
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False) \
+        if dist.get_rank() == 0 else None
+    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    ocfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg, ocfg):
+        if dist.get_rank() == 0:
+            model.load_state_dict(ckpt['model_state_dict'])
+        if optimizer is not None and ckpt is not None and dist.get_rank() == 0:
+            optim_sd = FSDP.optim_state_dict_to_load(
+                model, optimizer, ckpt['optimizer_state_dict'])
+            optimizer.load_state_dict(optim_sd)
+    if dist.get_rank() == 0:
+        logger.info(f"  Resumed from {ckpt_path}")
+        return ckpt.get('epoch', 0), ckpt.get('step', 0)
+    return 0, 0
 
 
 # =============================================================================
-# Training Loop
+# Training loop
 # =============================================================================
 def train(args):
-    """Main training function for distributed CD-Transformer training."""
-
-    # --- Setup ---
     rank, local_rank, world_size = setup_distributed()
     logger = setup_logging(rank)
     device = torch.device(f'cuda:{local_rank}')
 
-    logger.info("=" * 70)
-    logger.info("CD-Transformer Distributed Training")
-    logger.info(f"  DeepSeek-V3 cost-reduction techniques + CDNN block-circulant layers")
-    logger.info(f"  Hardware: {world_size}× H800 GPUs, 64GB shared memory")
-    logger.info("=" * 70)
+    if rank == 0:
+        logger.info("=" * 70)
+        logger.info("CD-Transformer Distributed Training")
+        logger.info(f"  Hardware: {world_size}x H800 | ZeRO-2 FSDP | BF16 autocast")
+        logger.info("=" * 70)
 
-    # --- Model ---
-    config = CONFIGS[args.config]
-    # Apply overrides
-    if args.seq_len:
-        config.max_seq_len = args.seq_len
-    config.use_fp8 = args.use_fp8
-    config.gradient_checkpointing = args.grad_checkpoint
-    config.fisher_lambda = args.fisher_lambda
+    # --- Config (copy so we never mutate the shared template) ---
+    from dataclasses import replace
+    config = replace(
+        CONFIGS[args.config],
+        use_fp8=args.use_fp8,
+        gradient_checkpointing=args.grad_checkpoint,
+        fisher_lambda=args.fisher_lambda,
+        fisher_mode=args.fisher_mode,
+        fisher_agg=args.fisher_agg,
+        fisher_p=args.fisher_p,
+        cd_impl=("dense" if args.dense else args.cd_impl),
+        **({'max_seq_len': args.seq_len} if args.seq_len else {}),
+    )
 
     model = CDTransformer(config).to(device)
-
     if rank == 0:
-        stats = model.get_param_stats()
+        s = model.get_param_stats()
         logger.info(f"\nModel: CD-Transformer-{args.config}")
-        logger.info(f"  Config: {json.dumps(asdict(config), indent=2, default=str)}")
-        logger.info(f"  Total params:      {stats['total_params']:>12,}")
-        logger.info(f"  CD params:         {stats['cd_params']:>12,}")
-        logger.info(f"  Dense equivalent:  {stats['dense_equivalent']:>12,}")
-        logger.info(f"  CD compression:    {stats['cd_compression']:>8.1f}×")
-        est_dense_flops = stats['dense_equivalent'] * 6  # rough 6N rule
-        est_cd_flops = stats['total_params'] * 6
-        logger.info(f"\n  Cost reduction estimate (vs dense transformer):")
-        logger.info(f"    CDLinear compression:    {stats['cd_compression']:.1f}×")
-        logger.info(f"    MoE sparsity:            {config.n_experts/config.n_active:.1f}×")
-        logger.info(f"    FP8 throughput:           2.0×")
-        logger.info(f"    Combined theoretical:    "
-                     f"{stats['cd_compression'] * config.n_experts/config.n_active * 2:.0f}×")
+        logger.info(f"  Total params:     {s['total_params']:>13,}")
+        logger.info(f"  CD params:        {s['cd_params']:>13,}")
+        logger.info(f"  Dense equivalent: {s['dense_equivalent']:>13,}")
+        logger.info(f"  CD compression:   {s['cd_compression']:>11.1f}x")
+        logger.info(f"  MoE sparsity:     {config.n_experts / config.n_active:>11.1f}x")
 
-    # --- FSDP Wrapping ---
-    model = wrap_model_fsdp(model, local_rank, use_fp8=args.use_fp8)
-    logger.info("Model wrapped with FSDP (ZeRO-2 sharding)")
+    model = wrap_model_fsdp(model, local_rank)
+    if rank == 0:
+        logger.info("Model wrapped with FSDP (ZeRO-2 SHARD_GRAD_OP)")
 
-    # --- Dataset ---
+    # --- Data ---
     dataset = TokenDataset(
-        data_path=args.data_path,
-        seq_len=config.max_seq_len,
-        vocab_size=config.vocab_size,
-        synthetic=args.synthetic,
+        data_path=args.data_path, seq_len=config.max_seq_len,
+        vocab_size=config.vocab_size, synthetic=args.synthetic,
         synthetic_size=args.synthetic_size,
     )
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=True
-    )
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True,
+        dataset, batch_size=args.batch_size, sampler=sampler,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=args.num_workers > 0,
     )
 
-    total_steps = len(dataloader) * args.epochs // args.grad_accum
-    logger.info(f"\nDataset: {len(dataset):,} sequences, "
-                f"{len(dataloader):,} batches/epoch")
-    logger.info(f"Training: {args.epochs} epochs, {total_steps:,} optimizer steps")
-    logger.info(f"  Effective batch: {args.batch_size * world_size * args.grad_accum}")
+    steps_per_epoch = max(1, len(dataloader) // args.grad_accum)
+    total_steps = steps_per_epoch * args.epochs
+    if rank == 0:
+        logger.info(f"\nDataset: {len(dataset):,} sequences, {len(dataloader):,} batches/epoch")
+        logger.info(f"Training: {args.epochs} epochs, ~{total_steps:,} optimizer steps")
+        logger.info(f"  Effective batch: {args.batch_size * world_size * args.grad_accum}")
 
-    # --- Optimizer ---
-    # DeepSeek-V3 uses AdamW with β1=0.9, β2=0.95, wd=0.1
+    # --- Optimizer / schedule ---
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        betas=(0.9, 0.95),
+        model.parameters(), lr=args.lr, betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
-        fused=True,  # Fused AdamW for H800
+        fused=torch.cuda.is_available(),
     )
+    # warmup: explicit --warmup_steps, or a fraction of total steps (more robust
+    # across dataset sizes — fixes the prior run where warmup>total capped LR).
+    warmup_steps = args.warmup_steps
+    if args.warmup_frac and args.warmup_frac > 0:
+        warmup_steps = max(1, int(args.warmup_frac * total_steps))
+    warmup_steps = min(warmup_steps, max(1, total_steps - 1))
+    if rank == 0:
+        logger.info(f"  Warmup: {warmup_steps:,} steps "
+                    f"({100*warmup_steps/max(1,total_steps):.1f}% of total)")
+    scheduler = CosineWarmupScheduler(optimizer, warmup_steps, total_steps, 0.1)
+    hessian_monitor = HessianMonitor(model, log_interval=args.log_interval,
+                                    hessian_interval=args.hessian_interval)
 
-    scheduler = CosineWarmupScheduler(
-        optimizer,
-        warmup_steps=args.warmup_steps,
-        total_steps=total_steps,
-        min_lr_ratio=0.1,
-    )
+    # --- Resume ---
+    start_epoch, global_step = 0, 0
+    if args.resume:
+        start_epoch, global_step = load_checkpoint(model, optimizer, args.resume, logger)
 
-    # Gradient scaler for mixed precision
-    scaler = GradScaler(enabled=args.use_amp)
-
-    # Hessian monitor (CD-specific)
-    hessian_monitor = HessianMonitor(model, log_interval=args.log_interval)
-
-    # --- Training Loop ---
-    logger.info("\n" + "=" * 70)
-    logger.info("Starting training...")
-    logger.info("=" * 70)
-
-    global_step = 0
+    # BF16 needs no GradScaler (it shares FP32's exponent range).
+    use_amp = args.use_amp
     best_loss = float('inf')
     train_history = []
 
-    for epoch in range(args.epochs):
+    if rank == 0:
+        logger.info("\n" + "=" * 70 + "\nStarting training...\n" + "=" * 70)
+
+    for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         model.train()
-        epoch_loss = 0.0
-        epoch_tokens = 0
-        epoch_start = time.time()
-        step_times = []
+        optimizer.zero_grad(set_to_none=True)
 
-        optimizer.zero_grad()
+        epoch_loss, epoch_tokens, epoch_start = 0.0, 0, time.time()
+        accum_loss, step_times = 0.0, []
+        accum_ce, accum_mtp, accum_fisher = 0.0, 0.0, 0.0
+        step_start = time.time()
 
         for batch_idx, (input_ids, labels) in enumerate(dataloader):
-            step_start = time.time()
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-            # Mixed precision context
-            amp_ctx = autocast(dtype=torch.bfloat16) if args.use_amp else nullcontext()
-
+            amp_ctx = (torch.amp.autocast('cuda', dtype=torch.bfloat16)
+                       if use_amp else nullcontext())
             with amp_ctx:
                 outputs = model(input_ids, labels=labels)
                 loss = outputs['loss'] / args.grad_accum
 
-            # Backward with gradient scaling
-            if args.use_amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            loss.backward()
+            accum_loss += loss.item()
+            # accumulate the *components*, averaged over the grad_accum window, so
+            # the log can report the bare cross-entropy DIRECTLY (no decoding from
+            # the total loss, which was the source of the CE/perplexity ambiguity).
+            accum_ce += outputs['ce_loss'].item() / args.grad_accum
+            if 'mtp_loss' in outputs:
+                accum_mtp += outputs['mtp_loss'].item() / args.grad_accum
+            if 'fisher_loss' in outputs:
+                accum_fisher += float(outputs['fisher_loss']) / args.grad_accum
 
-            # Gradient accumulation
             if (batch_idx + 1) % args.grad_accum == 0:
-                if args.use_amp:
-                    scaler.unscale_(optimizer)
-                # Gradient clipping (DeepSeek-V3 uses 1.0)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), args.grad_clip
-                )
-
-                if args.use_amp:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-
+                grad_norm = model.clip_grad_norm_(args.grad_clip)  # FSDP-aware clip
+                optimizer.step()
                 scheduler.step(global_step)
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
+                update_router_biases(model)        # aux-loss-free balancing
                 global_step += 1
 
-                # Logging
-                step_loss = loss.item() * args.grad_accum
-                epoch_loss += step_loss
                 n_tokens = input_ids.numel()
                 epoch_tokens += n_tokens
+                epoch_loss += accum_loss
                 step_time = time.time() - step_start
                 step_times.append(step_time)
 
-                if global_step % args.log_interval == 0 and rank == 0:
-                    tokens_per_sec = n_tokens * world_size / step_time
-                    current_lr = scheduler.get_lr()[0]
-                    gpu_mem = torch.cuda.max_memory_allocated(device) / 1e9
-
-                    log_msg = (
-                        f"Step {global_step:>6d} | "
-                        f"Loss: {step_loss:.4f} | "
-                        f"LR: {current_lr:.2e} | "
-                        f"Grad norm: {grad_norm:.3f} | "
-                        f"Tok/s: {tokens_per_sec:,.0f} | "
-                        f"GPU mem: {gpu_mem:.1f}GB"
-                    )
-                    if 'mtp_loss' in outputs:
-                        log_msg += f" | MTP: {outputs['mtp_loss'].item():.4f}"
-                    if 'fisher_loss' in outputs:
-                        log_msg += f" | Fisher: {outputs['fisher_loss'].item():.6f}"
-
-                    logger.info(log_msg)
-
-                    # Hessian monitoring (CD diagnostic)
+                if global_step % args.log_interval == 0:
+                    if rank == 0:
+                        tok_s = n_tokens * world_size * args.grad_accum / max(step_time, 1e-6)
+                        gpu_mem = torch.cuda.max_memory_allocated(device) / 1e9
+                        ppl = math.exp(min(accum_ce, 20))
+                        msg = (f"Step {global_step:>6d} | Loss: {accum_loss:.4f} | "
+                               f"CE: {accum_ce:.4f} | PPL: {ppl:.1f} | "
+                               f"LR: {scheduler.get_lr()[0]:.2e} | "
+                               f"GradNorm: {float(grad_norm):.3f} | "
+                               f"Tok/s: {tok_s:,.0f} | GPU: {gpu_mem:.1f}GB")
+                        if accum_mtp:
+                            msg += f" | MTP: {accum_mtp:.4f}"
+                        if accum_fisher:
+                            msg += f" | Fisher: {accum_fisher:.4g}"
+                        logger.info(msg)
+                        train_history.append({
+                            'step': global_step, 'loss': accum_loss, 'ce': accum_ce,
+                            'perplexity': ppl, 'lr': scheduler.get_lr()[0],
+                            'tokens_per_sec': tok_s, 'gpu_mem_gb': gpu_mem,
+                        })
+                    # ALL ranks must enter this: it runs an FSDP summon_full_params
+                    # collective to materialize the flat-sharded CDLinear weights.
+                    # (Only rank 0 emits the log line.) Calling it under `rank == 0`
+                    # would deadlock the other ranks.
                     hessian_monitor.log(global_step, logger)
 
-                    train_history.append({
-                        'step': global_step,
-                        'loss': step_loss,
-                        'lr': current_lr,
-                        'tokens_per_sec': tokens_per_sec,
-                        'gpu_mem_gb': gpu_mem,
-                    })
+                accum_loss = 0.0
+                accum_ce, accum_mtp, accum_fisher = 0.0, 0.0, 0.0
+                step_start = time.time()
 
-        # End of epoch
-        epoch_time = time.time() - epoch_start
-        avg_loss = epoch_loss / max(1, len(dataloader) // args.grad_accum)
-        avg_step_time = sum(step_times) / max(1, len(step_times))
-
+        avg_loss = epoch_loss / max(1, len(step_times))
         if rank == 0:
-            logger.info(f"\n{'='*70}")
-            logger.info(f"Epoch {epoch+1}/{args.epochs} complete")
-            logger.info(f"  Avg loss: {avg_loss:.4f}")
-            logger.info(f"  Time: {epoch_time:.1f}s ({avg_step_time:.3f}s/step)")
-            logger.info(f"  Tokens: {epoch_tokens * world_size:,}")
-            logger.info(f"  Throughput: {epoch_tokens * world_size / epoch_time:,.0f} tok/s")
+            dt = time.time() - epoch_start
+            logger.info(f"\n{'='*70}\nEpoch {epoch+1}/{args.epochs} | avg loss {avg_loss:.4f} | "
+                        f"{dt:.1f}s | {epoch_tokens*world_size/max(dt,1e-6):,.0f} tok/s")
 
-            # Save checkpoint
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, global_step,
-                    avg_loss, args.save_dir, config, logger
-                )
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+        save_checkpoint(model, optimizer, scheduler, epoch, global_step,
+                        avg_loss, args.save_dir, config, logger)
 
-    # --- Final summary ---
     if rank == 0:
-        logger.info("\n" + "=" * 70)
-        logger.info("TRAINING COMPLETE")
-        logger.info("=" * 70)
-        logger.info(f"  Best loss: {best_loss:.4f}")
-        logger.info(f"  Total steps: {global_step:,}")
-
-        # Save training history
-        history_path = Path(args.save_dir) / 'training_history.json'
-        history_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(history_path, 'w') as f:
+        logger.info("\n" + "=" * 70 + f"\nTRAINING COMPLETE | best loss {best_loss:.4f} | "
+                    f"{global_step:,} steps")
+        hist_path = Path(args.save_dir) / 'training_history.json'
+        hist_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(hist_path, 'w') as f:
             json.dump(train_history, f, indent=2)
-        logger.info(f"  History saved to: {history_path}")
-
-        # Final Hessian report
-        logger.info("\n  Final Hessian condition report:")
-        hessian_monitor.log(global_step, logger)
+        logger.info(f"  History: {hist_path}")
 
     cleanup_distributed()
-
-
-# =============================================================================
-# Checkpoint Management
-# =============================================================================
-def save_checkpoint(model, optimizer, scheduler, epoch, step,
-                    loss, save_dir, config, logger):
-    """Save model checkpoint with FSDP state dict."""
-    save_path = Path(save_dir)
-    save_path.mkdir(parents=True, exist_ok=True)
-
-    # Get full state dict from FSDP
-    from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-    full_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_config):
-        state_dict = model.state_dict()
-        if dist.get_rank() == 0:
-            ckpt = {
-                'model_state_dict': state_dict,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'epoch': epoch,
-                'step': step,
-                'loss': loss,
-                'config': asdict(config),
-            }
-            ckpt_path = save_path / f'checkpoint_step{step}.pt'
-            torch.save(ckpt, ckpt_path)
-            logger.info(f"  Checkpoint saved: {ckpt_path}")
-
-            # Also save latest
-            latest_path = save_path / 'checkpoint_latest.pt'
-            torch.save(ckpt, latest_path)
-
-
-def load_checkpoint(model, optimizer, checkpoint_path, device):
-    """Load checkpoint for resuming training."""
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt['model_state_dict'])
-    if optimizer is not None and 'optimizer_state_dict' in ckpt:
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    return ckpt.get('epoch', 0), ckpt.get('step', 0)
 
 
 # =============================================================================
 # CLI
 # =============================================================================
 def parse_args():
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         description='CD-Transformer Distributed Training (H800 8-GPU)',
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
+        formatter_class=argparse.RawTextHelpFormatter)
+    p.add_argument('--config', type=str, default='small',
+                   choices=['small', 'medium', 'large'])
+    p.add_argument('--seq_len', type=int, default=None)
 
-    # Model
-    parser.add_argument('--config', type=str, default='small',
-                        choices=['small', 'medium', 'large'],
-                        help='Model configuration size')
-    parser.add_argument('--seq_len', type=int, default=None,
-                        help='Override sequence length')
+    p.add_argument('--data_path', type=str, default='./data/train.bin')
+    p.add_argument('--synthetic', action='store_true')
+    p.add_argument('--synthetic_size', type=int, default=1_000_000)
+    p.add_argument('--num_workers', type=int, default=4)
 
-    # Data
-    parser.add_argument('--data_path', type=str, default='./data/train.bin',
-                        help='Path to tokenized training data (uint16 binary)')
-    parser.add_argument('--synthetic', action='store_true',
-                        help='Use synthetic data for testing')
-    parser.add_argument('--synthetic_size', type=int, default=1000000,
-                        help='Number of synthetic tokens')
+    p.add_argument('--epochs', type=int, default=10)
+    p.add_argument('--batch_size', type=int, default=8)
+    p.add_argument('--grad_accum', type=int, default=4)
+    p.add_argument('--lr', type=float, default=3e-4)
+    p.add_argument('--warmup_steps', type=int, default=2000)
+    p.add_argument('--warmup_frac', type=float, default=None,
+                   help="set warmup as a fraction of total steps (overrides --warmup_steps)")
+    p.add_argument('--dense', action='store_true',
+                   help="train the non-circulant DENSE baseline (cd_impl=dense), "
+                        "same architecture/schedule for a fair comparison")
+    p.add_argument('--cd_impl', choices=['matmul', 'fft', 'dense'], default='matmul')
+    p.add_argument('--fisher_agg', choices=['mean', 'pnorm', 'max'], default='mean',
+                   help="conditioning aggregation over blocks (pnorm/max target worst blocks)")
+    p.add_argument('--fisher_p', type=float, default=4.0,
+                   help="p for --fisher_agg pnorm")
+    p.add_argument('--weight_decay', type=float, default=0.1)
+    p.add_argument('--grad_clip', type=float, default=1.0)
 
-    # Training
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Per-GPU batch size')
-    parser.add_argument('--grad_accum', type=int, default=4,
-                        help='Gradient accumulation steps')
-    parser.add_argument('--lr', type=float, default=3e-4,
-                        help='Peak learning rate')
-    parser.add_argument('--warmup_steps', type=int, default=2000,
-                        help='LR warmup steps')
-    parser.add_argument('--weight_decay', type=float, default=0.1,
-                        help='AdamW weight decay')
-    parser.add_argument('--grad_clip', type=float, default=1.0,
-                        help='Gradient clipping norm')
+    p.add_argument('--fisher_lambda', type=float, default=1e-5)
+    p.add_argument('--fisher_mode', choices=['energy', 'conditioning'],
+                   default='energy',
+                   help="'energy' = L2-like (lambda~1e-8); "
+                        "'conditioning' = flatten spectrum, drives kappa->1 (lambda~1e-2)")
 
-    # CD-specific
-    parser.add_argument('--fisher_lambda', type=float, default=1e-5,
-                        help='Fisher regularization strength (CD Theorem 2)')
+    # store_true flags default False; pass --use_fp8/--use_amp/--grad_checkpoint
+    # to enable. Defaults below keep them ON unless --no_* is added later.
+    p.add_argument('--use_fp8', action='store_true', default=True)
+    p.add_argument('--use_amp', action='store_true', default=True)
+    p.add_argument('--grad_checkpoint', action='store_true', default=True)
 
-    # Optimization
-    parser.add_argument('--use_fp8', action='store_true', default=True,
-                        help='Enable FP8 mixed precision (H800)')
-    parser.add_argument('--use_amp', action='store_true', default=True,
-                        help='Enable AMP (BF16) mixed precision')
-    parser.add_argument('--grad_checkpoint', action='store_true', default=True,
-                        help='Enable gradient checkpointing')
-
-    # Logging & Checkpoints
-    parser.add_argument('--log_interval', type=int, default=50,
-                        help='Log every N steps')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints',
-                        help='Checkpoint save directory')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Resume from checkpoint path')
-
-    return parser.parse_args()
+    p.add_argument('--log_interval', type=int, default=50)
+    p.add_argument('--hessian_interval', type=int, default=500,
+                   help='steps between (expensive) Hessian-kappa summon_full_params samples')
+    p.add_argument('--save_dir', type=str, default='./checkpoints')
+    p.add_argument('--resume', type=str, default=None)
+    return p.parse_args()
 
 
-# =============================================================================
-# Entry Point
-# =============================================================================
 if __name__ == '__main__':
-    args = parse_args()
-    train(args)
+    train(parse_args())

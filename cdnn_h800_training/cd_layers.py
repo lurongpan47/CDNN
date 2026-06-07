@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-cd_layers.py — Communication Dynamics Neural Network Layers (PyTorch + CUDA)
+cd_layers.py — Communication Dynamics Neural Network Layers (PyTorch)
 =============================================================================
 
 PyTorch reimplementation of Pan (2026) CD-NN layers, optimized for
-multi-GPU H800 training with DeepSeek-V3–style cost-reduction techniques:
+multi-GPU H800 training with DeepSeek-V3-style cost-reduction techniques.
 
-  1. CDLinear          — Block-circulant linear layer (FFT-diagonalized)
-  2. CDMoELayer        — Mixture-of-Experts with CDLinear experts
-  3. ShannonDropout    — alpha_CD = 0.0118 principled noise injection
-  4. CDAttention       — Multi-head Latent Attention with CD-compressed KV
-  5. CDTransformerBlock — Full transformer block combining MLA + CD-MoE
-
-Key DeepSeek-V3 techniques integrated:
-  - FP8 mixed-precision training (torch.float8_e4m3fn / e5m2)
-  - Multi-head Latent Attention (MLA) with low-rank KV compression
-  - Auxiliary-loss-free load balancing for MoE
-  - Tensor parallelism for 8-GPU H800 clusters
-  - Gradient checkpointing for memory efficiency
+  1. CDLinear           — Block-circulant linear layer (FFT-diagonalized)
+  2. ShannonDropout     — alpha_CD = 0.0118 principled noise injection
+  3. RMSNorm            — DeepSeek-V3 style normalization (fp32 reduction)
+  4. CDAttention        — Latent-KV attention with CD-compressed projections
+  5. CDMoELayer         — Mixture-of-Experts with CDLinear experts
+  6. CDTransformerBlock — Full transformer block (attention + CD-MoE)
+  7. fisher_reg_loss    — Closed-form Fisher regularizer (Parseval identity)
 
 Reference:
   L. Pan (2026), "Communication Dynamics Neural Networks:
@@ -27,15 +22,27 @@ Reference:
 
 Authors: L. Pan (Ainnocence Inc.)
 License: MIT
+
+-----------------------------------------------------------------------------
+NOTE ON FP8 / DeepSeek kernels
+-----------------------------------------------------------------------------
+The actual compute path runs in BF16 under autocast (correct and stable on
+H800). True end-to-end FP8 on H800 should be obtained from DeepSeek's
+production-tested kernels rather than ad-hoc `_scaled_mm` calls:
+  - DeepGEMM  : FP8 dense + grouped/masked MoE GEMM (github.com/deepseek-ai/DeepGEMM)
+  - FlashMLA  : Hopper MLA decode kernel        (github.com/deepseek-ai/FlashMLA)
+  - DeepEP    : expert-parallel all-to-all       (github.com/deepseek-ai/DeepEP)
+`use_fp8` is kept as a forward-looking flag and a small reference
+`fp8_matmul` helper is provided, but it is NOT on the default hot path.
 =============================================================================
 """
 
 import math
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import custom_fwd, custom_bwd
-from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # CD Physical Constants (from Pan & Tanik, Paper I)
@@ -45,83 +52,70 @@ LAMBDA_CEIL = 4.0        # Sadovskii lattice-instability ceiling
 
 
 # =============================================================================
-# FP8 Utilities — DeepSeek-V3 style mixed precision
+# FP8 reference helper (OPTIONAL — not on the default compute path)
 # =============================================================================
-def fp8_cast(tensor: torch.Tensor, dtype=None) -> torch.Tensor:
-    """Cast tensor to FP8 format for compute, with scale factor tracking.
+def fp8_cast(tensor: torch.Tensor, dtype=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Cast a tensor to FP8 with a single global amax scale.
 
-    DeepSeek-V3 pioneered FP8-first training on frontier-scale models.
-    We use E4M3 for forward (higher precision) and E5M2 for gradients
-    (wider dynamic range).
+    Always returns ``(fp8_tensor, scale)`` so callers can unpack uniformly.
+    Returns BF16 (scale=1) when FP8 is unavailable.
     """
     if dtype is None:
-        dtype = torch.float8_e4m3fn
-    if not hasattr(torch, 'float8_e4m3fn'):
-        # Fallback for older PyTorch without FP8 support
-        return tensor.half()
+        dtype = getattr(torch, "float8_e4m3fn", None)
+    if dtype is None:  # no FP8 support in this build
+        return tensor.bfloat16(), torch.ones((), device=tensor.device, dtype=torch.float32)
+
     amax = tensor.abs().amax().clamp(min=1e-12)
-    # Scale to fill FP8 dynamic range
-    if dtype == torch.float8_e4m3fn:
-        scale = 448.0 / amax  # E4M3 max ~448
-    else:
-        scale = 57344.0 / amax  # E5M2 max ~57344
-    return (tensor * scale).to(dtype), scale
+    fp8_max = 448.0 if dtype == torch.float8_e4m3fn else 57344.0  # E4M3 / E5M2
+    scale = (fp8_max / amax).to(torch.float32)
+    return (tensor.float() * scale).to(dtype), scale
 
 
-def fp8_matmul(a: torch.Tensor, b: torch.Tensor,
-               use_fp8: bool = True) -> torch.Tensor:
-    """FP8-accelerated matrix multiply with automatic scaling.
+def fp8_matmul(a: torch.Tensor, b: torch.Tensor, use_fp8: bool = True) -> torch.Tensor:
+    """Reference FP8 GEMM via ``torch._scaled_mm`` (2-D inputs only).
 
-    Falls back to BF16 if FP8 hardware is not available.
+    Falls back to BF16 matmul. For production FP8 use DeepGEMM instead.
     """
-    if use_fp8 and hasattr(torch, 'float8_e4m3fn') and a.is_cuda:
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if use_fp8 and fp8 is not None and a.is_cuda and a.dim() == 2 and b.dim() == 2:
         try:
-            a_fp8, a_scale = fp8_cast(a.float(), torch.float8_e4m3fn)
-            b_fp8, b_scale = fp8_cast(b.float(), torch.float8_e4m3fn)
-            # Use torch._scaled_mm for FP8 GEMM on H800
-            out = torch._scaled_mm(
-                a_fp8, b_fp8.t(),
-                scale_a=torch.tensor(1.0 / a_scale, device=a.device),
-                scale_b=torch.tensor(1.0 / b_scale, device=b.device),
-                out_dtype=torch.bfloat16
+            a_fp8, a_scale = fp8_cast(a, fp8)
+            b_fp8, b_scale = fp8_cast(b, fp8)
+            return torch._scaled_mm(
+                a_fp8, b_fp8.t().contiguous().t(),
+                scale_a=(1.0 / a_scale).reshape(1, 1),
+                scale_b=(1.0 / b_scale).reshape(1, 1),
+                out_dtype=torch.bfloat16,
             )
-            return out
         except (RuntimeError, AttributeError):
             pass
-    # Fallback: BF16 matmul
-    return torch.matmul(a.bfloat16(), b.bfloat16()).float()
+    return torch.matmul(a.bfloat16(), b.bfloat16())
 
 
 # =============================================================================
-# 1. CDLinear: BLOCK-CIRCULANT LAYER (FFT-DIAGONALIZED) — PyTorch
+# 1. CDLinear: BLOCK-CIRCULANT LAYER (FFT-DIAGONALIZED)
 # =============================================================================
 class CDLinear(nn.Module):
     """Block-circulant linear layer with FFT-diagonalized Hessian.
 
     Maps R^{n_in} -> R^{n_out} via a block-circulant weight matrix with
-    block size B = 2L+1 (the polygon multiplicity from CD theory).
+    block size B. Only the first column of each circulant block is learned,
+    giving a B x parameter reduction vs a dense layer.
 
-    Key theoretical properties (Theorems 1-2 from Pan 2026):
-      - Hessian eigenvalues = |FFT(input_block)|^2, readable from a single FFT
-      - Under pre-whitening: κ(Hessian) = 1 exactly
-      - Empirical κ ≤ 1 + O(√(B/N)) on N samples
-      - Parameter count: n_in × n_out / B  (B× compression vs dense)
+    Forward (per output/input block pair, summed over input blocks):
+        y_block = IFFT( FFT(c) * FFT(x_block) )          [circular convolution]
 
-    Parameters
-    ----------
-    n_in, n_out : int
-        Input / output dimensions. Internally padded to multiples of `block`.
-    block : int
-        CD polygon multiplicity B = 2L+1. Choose from {1, 3, 5, 7, ...}.
-    use_fp8 : bool
-        Enable FP8 mixed precision for the FFT-domain matmul.
+    Theory (Pan 2026):
+      - Hessian eigenvalues of each block = |FFT(c)|^2  (Theorem 1)
+      - Under pre-whitening, condition number k -> 1     (Theorem 2)
     """
 
     def __init__(self, n_in: int, n_out: int, block: int = 5,
-                 use_fp8: bool = True, bias: bool = True):
+                 use_fp8: bool = True, bias: bool = True, impl: str = "matmul"):
         super().__init__()
         self.block = block
         self.use_fp8 = use_fp8
+        self.impl = impl                 # "matmul", "fft", or "dense" (baseline)
 
         # Pad dimensions to multiples of block
         self.n_in_raw = n_in
@@ -131,103 +125,155 @@ class CDLinear(nn.Module):
         self.K_in = self.n_in // block
         self.K_out = self.n_out // block
 
-        # First-row coefficients of each circulant block: (K_out, K_in, B)
-        # This is the ONLY learned parameter — B× fewer than dense W
         std = math.sqrt(2.0 / self.n_in)
-        self.c = nn.Parameter(torch.randn(self.K_out, self.K_in, block) * std)
-
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(self.n_out))
+        if impl == "dense":
+            # Full dense weight: the non-circulant baseline (no compression).
+            # Same module interface so the rest of the model is untouched; the
+            # Fisher/conditioning regularizers skip dense layers (c is None).
+            self.weight = nn.Parameter(torch.randn(self.n_out, self.n_in) * std)
+            self.c = None
         else:
-            self.bias = None
+            # First-column coefficients of each circulant block: (K_out, K_in, B)
+            # This is the ONLY learned weight — B x fewer than dense W.
+            self.weight = None
+            self.c = nn.Parameter(torch.randn(self.K_out, self.K_in, block) * std)
 
-        # Pre-compute FFT twiddle factors (fixed, not learned)
-        self.register_buffer(
-            'dft_matrix',
-            torch.fft.fft(torch.eye(block), dim=-1),
-            persistent=False
-        )
+        self.bias = nn.Parameter(torch.zeros(self.n_out)) if bias else None
+
+        # Circulant gather index: C[i, j] = c[(i - j) mod B]. Used by the matmul
+        # path to build the effective weight from c on the fly (no extra params).
+        if impl != "dense":
+            idx = (torch.arange(block).unsqueeze(1)
+                   - torch.arange(block).unsqueeze(0)) % block
+            self.register_buffer("_circ_idx", idx, persistent=False)
+
+    def _dense_weight(self, dtype):
+        """Build the effective dense weight (n_out, n_in) from the circulant
+        generators c. Differentiable; transient (recomputed each forward, and
+        under gradient checkpointing recomputed in backward), so it costs no
+        stored activation that scales with batch×seq."""
+        Wb = self.c[:, :, self._circ_idx]               # (K_out, K_in, B, B)
+        W = Wb.permute(0, 2, 1, 3).reshape(self.n_out, self.n_in)
+        return W.to(dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, *, n_in_raw) -> (batch, *, n_out_raw)"""
+        """x: (..., n_in_raw) -> (..., n_out_raw)"""
         orig_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
-        batch = x.shape[0]
-
-        # Pad input if needed
+        n = x.shape[0]
         if x.shape[-1] < self.n_in:
             x = F.pad(x, (0, self.n_in - x.shape[-1]))
 
-        # Reshape to (batch, K_in, B) for block-circulant products
-        x_blk = x.reshape(batch, self.K_in, self.block)
+        if self.impl == "dense":
+            y = F.linear(x, self.weight, self.bias)
+        elif self.impl == "matmul":
+            # Tensor-core dense GEMM with a weight built from c. Mathematically
+            # identical to the circular convolution but uses BF16 matmul and
+            # keeps no token-scaled FFT intermediates -> high MFU, low memory.
+            W = self._dense_weight(x.dtype)
+            y = F.linear(x, W, self.bias)
+        else:
+            y = self._forward_fft(x)
+        y = y[..., :self.n_out_raw]
+        return y.reshape(*orig_shape, self.n_out_raw)
 
-        # === FFT-domain multiplication (core CD operation) ===
-        # Instead of spatial-domain circulant matmul O(K_out * K_in * B^2),
-        # we do pointwise multiply in FFT domain: O(K_out * K_in * B log B)
-        x_fft = torch.fft.fft(x_blk, dim=-1)           # (batch, K_in, B)
-        c_fft = torch.fft.fft(self.c, dim=-1)           # (K_out, K_in, B)
-
-        # Batched pointwise multiply and sum over K_in
-        # y_fft[n, o, k] = sum_{i} c_fft[o, i, k] * x_fft[n, i, k]
-        #   n = batch, o = K_out, i = K_in, k = block (FFT bin)
-        y_fft = torch.einsum('oik,nik->nok', c_fft, x_fft)  # (batch, K_out, B)
-        y_blk = torch.fft.ifft(y_fft, dim=-1).real       # (batch, K_out, B)
-
-        y = y_blk.reshape(batch, self.n_out)
-
+    def _forward_fft(self, x: torch.Tensor) -> torch.Tensor:
+        """Reference FFT-domain circular convolution (fp32; slower on GPU at
+        small block size, kept for verification / large-block use)."""
+        n = x.shape[0]
+        x_blk = x.reshape(n, self.K_in, self.block)
+        x_fft = torch.fft.fft(x_blk.float(), dim=-1)
+        c_fft = torch.fft.fft(self.c.float(), dim=-1)
+        y_fft = torch.einsum('oik,nik->nok', c_fft, x_fft)
+        y_blk = torch.fft.ifft(y_fft, dim=-1).real
+        y = y_blk.reshape(n, self.n_out).to(x.dtype)
         if self.bias is not None:
             y = y + self.bias
-
-        # Slice off padding
-        y = y[..., :self.n_out_raw]
-        y = y.reshape(*orig_shape, self.n_out_raw)
         return y
 
+    # --- diagnostics (no grad) -------------------------------------------
+    @torch.no_grad()
     def hessian_spectrum(self) -> torch.Tensor:
-        """Return FFT-diagonalized Hessian eigenvalues (Theorem 1).
+        """FFT-diagonalized Hessian eigenvalues |FFT(c)|^2 (Theorem 1)."""
+        if self.c.numel() == 0:          # FSDP flat-param placeholder; nothing to do
+            return self.c.new_zeros(0)
+        c_fft = torch.fft.fft(self.c.float(), dim=-1)
+        return c_fft.abs().pow(2).flatten()
 
-        These are |FFT(c)|^2 for each circulant block — readable
-        without any matrix decomposition.
-        """
-        with torch.no_grad():
-            c_fft = torch.fft.fft(self.c, dim=-1)
-            return torch.abs(c_fft).pow(2).flatten()
-
+    @torch.no_grad()
     def condition_number(self) -> float:
-        """Compute Hessian condition number κ = max(eig) / min(eig).
-
-        Theorem 2 (Pan 2026): For pre-whitened inputs, κ = 1 exactly.
-        Empirically, κ ≤ 1 + O(√(B/N)).
-        """
+        """Hessian condition number k = max(eig) / min(eig) (Theorem 2)."""
         spec = self.hessian_spectrum()
         spec = spec[spec > 1e-12]
         if spec.numel() == 0:
             return float('nan')
         return float(spec.max() / spec.min())
 
+    # --- differentiable regularizer term ---------------------------------
+    def fft_energy(self) -> torch.Tensor:
+        """Differentiable sum of Hessian eigenvalues, sum_k |FFT(c)|^2.
+
+        By Parseval/Plancherel, sum_k |FFT(c)|^2 = B * ||c||^2 exactly, so we
+        return ``block * c.pow(2).sum()``. This is:
+          * fully differentiable (the FFT-then-abs path is detached),
+          * autocast / FSDP safe (no FFT, separable across shards),
+          * numerically benign (well-conditioned weight-decay-like penalty).
+        """
+        if self.c is None:
+            return torch.zeros((), device=self.weight.device)
+        return self.block * self.c.float().pow(2).sum()
+
+    def spectral_flatness_penalty(self, eps: float = 1e-8) -> torch.Tensor:
+        """Conditioning penalty matching CDNN paper Eq. (9): the variance of the
+        (half-)log Hessian spectrum, averaged over circulant blocks.
+
+            L = mean_blocks  Var_k( 1/2 * log s_k ),   s_k = |FFT(c)_k|^2
+
+        Var_k(1/2 log s_k) = Var_k( log|FFT(c)_k| ). This is >= 0, equals 0 iff
+        the spectrum is flat (the kappa = 1 optimum of Theorem 2), is fully
+        differentiable through to the circulant coefficients c, scale-invariant
+        (a global scaling of c shifts every log by a constant, leaving the
+        variance unchanged), and bounded for any finite-magnitude spectrum --
+        unlike the trace-of-inverse form tr(I^-1) = sum 1/sigma^2, which diverges
+        as sigma -> 0. Penalizes only the spectral spread that drives kappa from 1.
+        """
+        if self.c is None:                       # dense baseline: no spectrum
+            return torch.zeros((), device=self.weight.device)
+        cf = torch.fft.fft(self.c.float(), dim=-1)
+        half_log_s = (cf.abs() + eps).log()          # 1/2 log s_k = log|FFT(c)_k|
+        return half_log_s.var(dim=-1, unbiased=False).mean()
+
+    def spectral_flatness_blocks(self, eps: float = 1e-8) -> torch.Tensor:
+        """Per-circulant-block spectral-spread penalty, flattened to (K_out*K_in,).
+        Used by ``fisher_reg_loss`` for worst-block (p-norm / max) aggregation so
+        a few catastrophic blocks are not diluted by the well-conditioned majority
+        (the mean-aggregation limitation seen at language-model scale)."""
+        if self.c is None:
+            return self.weight.new_zeros(0)
+        cf = torch.fft.fft(self.c.float(), dim=-1)
+        half_log_s = (cf.abs() + eps).log()
+        return half_log_s.var(dim=-1, unbiased=False).reshape(-1)
+
     @property
     def compression_ratio(self) -> float:
-        """Parameter compression vs equivalent dense layer."""
-        dense_params = self.n_in_raw * self.n_out_raw
-        cd_params = self.c.numel() + (self.bias.numel() if self.bias is not None else 0)
-        return dense_params / cd_params
+        if self.c is None:
+            return 1.0
+        dense = self.n_in_raw * self.n_out_raw
+        cd = self.c.numel() + (self.bias.numel() if self.bias is not None else 0)
+        return dense / cd
 
     def extra_repr(self) -> str:
+        nparam = self.weight.numel() if self.c is None else self.c.numel()
         return (f"n_in={self.n_in_raw}, n_out={self.n_out_raw}, "
-                f"block={self.block}, params={self.c.numel()}, "
-                f"compression={self.compression_ratio:.1f}×")
+                f"block={self.block}, impl={self.impl}, params={nparam}, "
+                f"compression={self.compression_ratio:.1f}x")
 
 
 # =============================================================================
-# 2. ShannonDropout — CD-derived principled noise injection
+# 2. ShannonDropout
 # =============================================================================
 class ShannonDropout(nn.Module):
-    """Dropout at rate α_CD = 0.0118, derived from Shannon channel theory.
-
-    Unlike standard dropout (tuned empirically in [0.1, 0.5]), CD prescribes
-    a transferable fixed rate calibrated from the Na D-doublet spectral
-    splitting in Paper I. This acts as a mild stochastic regularizer.
-    """
+    """Dropout at fixed rate alpha_CD = 0.0118 (Paper I)."""
 
     def __init__(self, p: float = ALPHA_CD):
         super().__init__()
@@ -236,146 +282,106 @@ class ShannonDropout(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training or self.p <= 0:
             return x
-        return F.dropout(x, p=self.p, training=self.training)
+        return F.dropout(x, p=self.p, training=True)
 
 
 # =============================================================================
-# 3. RMSNorm — DeepSeek-V3 style normalization
+# 3. RMSNorm (DeepSeek-V3 style, fp32 reduction)
 # =============================================================================
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (used in DeepSeek-V3)."""
-
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * norm * self.weight
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.to(dtype)) * self.weight
 
 
 # =============================================================================
-# 4. CDAttention — Multi-head Latent Attention with CD-compressed KV
+# 4. CDAttention — latent-KV attention with CD-compressed projections
 # =============================================================================
 class CDAttention(nn.Module):
-    """Multi-head Latent Attention (MLA) with CD-compressed projections.
+    """Attention with a low-rank KV latent (MLA-style) and CD-compressed
+    projection matrices.
 
-    Combines DeepSeek-V3's MLA (low-rank KV compression) with CDNN's
-    block-circulant projections for further parameter reduction.
+    Uses ``F.scaled_dot_product_attention`` so it dispatches to FlashAttention /
+    memory-efficient kernels on H800 and applies the causal mask without
+    materializing an (T x T) tensor.
 
-    MLA compresses KV to a low-rank latent space, reducing KV cache from
-    O(n_heads × d_head) to O(d_compress). The CD block-circulant structure
-    adds an additional B× compression on all projection matrices.
-
-    Parameters
-    ----------
-    dim : int
-        Model dimension.
-    n_heads : int
-        Number of attention heads.
-    kv_lora_rank : int
-        Latent dimension for KV compression (MLA).
-    qk_rope_dim : int
-        Dimension for rotary positional encoding.
-    block : int
-        CD polygon multiplicity for circulant projections.
+    This is a *simplified* MLA: the KV is compressed to ``kv_lora_rank`` and
+    decompressed per head; RoPE is applied to the full Q/K head dims. For the
+    production DeepSeek MLA decode path (decoupled RoPE + paged KV cache) use
+    FlashMLA at inference time.
     """
 
     def __init__(self, dim: int, n_heads: int = 16,
                  kv_lora_rank: int = 512,
-                 qk_rope_dim: int = 64,
                  block: int = 5,
-                 max_seq_len: int = 4096):
+                 max_seq_len: int = 4096,
+                 use_fp8: bool = True, impl: str = "matmul"):
         super().__init__()
+        assert dim % n_heads == 0, "dim must be divisible by n_heads"
         self.dim = dim
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
+        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
         self.kv_lora_rank = kv_lora_rank
-        self.qk_rope_dim = qk_rope_dim
-        self.scale = self.head_dim ** -0.5
 
-        # Query projection (CD-compressed)
-        self.wq = CDLinear(dim, n_heads * self.head_dim, block=block)
-
-        # KV down-projection to latent space (MLA core idea)
-        self.wkv_down = CDLinear(dim, kv_lora_rank + qk_rope_dim, block=block)
-
-        # KV up-projection from latent to per-head KV
-        self.wk_up = CDLinear(kv_lora_rank, n_heads * self.head_dim, block=block)
-        self.wv_up = CDLinear(kv_lora_rank, n_heads * self.head_dim, block=block)
-
-        # Output projection
-        self.wo = CDLinear(n_heads * self.head_dim, dim, block=block)
-
-        # RMSNorm for KV latent (DeepSeek-V3 uses this)
+        self.wq = CDLinear(dim, n_heads * self.head_dim, block=block, use_fp8=use_fp8, impl=impl)
+        self.wkv_down = CDLinear(dim, kv_lora_rank, block=block, use_fp8=use_fp8, impl=impl)
+        self.wk_up = CDLinear(kv_lora_rank, n_heads * self.head_dim, block=block, use_fp8=use_fp8, impl=impl)
+        self.wv_up = CDLinear(kv_lora_rank, n_heads * self.head_dim, block=block, use_fp8=use_fp8, impl=impl)
+        self.wo = CDLinear(n_heads * self.head_dim, dim, block=block, use_fp8=use_fp8, impl=impl)
         self.kv_norm = RMSNorm(kv_lora_rank)
 
-        # RoPE frequencies
         self.register_buffer(
-            'freqs_cis',
-            self._precompute_freqs(self.head_dim, max_seq_len),
+            'freqs_cis', self._precompute_freqs(self.head_dim, max_seq_len),
             persistent=False
         )
 
     @staticmethod
     def _precompute_freqs(dim: int, max_len: int, theta: float = 10000.0):
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(max_len)
+        t = torch.arange(max_len).float()
         freqs = torch.outer(t, freqs)
-        return torch.polar(torch.ones_like(freqs), freqs)
+        return torch.polar(torch.ones_like(freqs), freqs)        # (max_len, dim/2)
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        """Apply rotary positional encoding.
-
-        x: (B, n_heads, T, head_dim)
-        freqs: (T, head_dim/2) complex
-        """
-        x_complex = torch.view_as_complex(
+        # x: (B, n_heads, T, head_dim)
+        xc = torch.view_as_complex(
             x.float().reshape(*x.shape[:-1], -1, 2).contiguous()
-        )
-        T = x.shape[-2]
-        f = freqs[:T, :x_complex.shape[-1]].reshape(1, 1, T, -1)
-        x_rot = torch.view_as_real(x_complex * f).flatten(-2)
+        )                                                        # (B, nh, T, hd/2)
+        freqs = freqs[None, None, :x.shape[-2], :]               # (1,1,T,hd/2)
+        x_rot = torch.view_as_real(xc * freqs).flatten(-2)
         return x_rot.type_as(x)
 
     def forward(self, x: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        x: (batch, seq_len, dim)
-        mask: (batch, 1, seq_len, seq_len) optional causal mask
-        """
+                mask: Optional[torch.Tensor] = None,
+                is_causal: bool = True) -> torch.Tensor:
         B, T, D = x.shape
 
-        # Query
         q = self.wq(x).reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # MLA: compress KV to latent space, then decompress
-        kv_compressed = self.wkv_down(x)
-
-        # Split into KV latent + RoPE component
-        kv_latent = kv_compressed[..., :self.kv_lora_rank]
-        kv_rope = kv_compressed[..., self.kv_lora_rank:]
-
-        # Normalize latent (DeepSeek-V3 practice)
-        kv_latent = self.kv_norm(kv_latent)
-
-        # Decompress to per-head K and V
+        kv_latent = self.kv_norm(self.wkv_down(x))               # (B, T, rank)
         k = self.wk_up(kv_latent).reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.wv_up(kv_latent).reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Apply RoPE to Q and K
         freqs = self.freqs_cis[:T].to(x.device)
         q = self._apply_rope(q, freqs)
         k = self._apply_rope(k, freqs)
 
-        # Scaled dot-product attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float('-inf'))
-        attn = F.softmax(attn, dim=-1)
-
-        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        # FlashAttention / mem-efficient kernel. If an explicit additive mask
+        # is supplied, use it; otherwise rely on the fast is_causal path.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            is_causal=(mask is None and is_causal),
+        )
+        out = out.transpose(1, 2).reshape(B, T, D)
         return self.wo(out)
 
 
@@ -383,192 +389,197 @@ class CDAttention(nn.Module):
 # 5. CDMoELayer — Mixture-of-Experts with CDLinear experts
 # =============================================================================
 class CDMoELayer(nn.Module):
-    """Mixture-of-Experts FFN using CDLinear experts.
+    """MoE FFN with CDLinear experts and DeepSeek-V3 auxiliary-loss-free
+    load balancing (a learnable per-expert bias adjusted from observed load).
 
-    Combines DeepSeek-V3's MoE design (256 experts, 8 active, auxiliary-
-    loss-free load balancing) with CDNN's block-circulant parameter
-    efficiency.
+    Optimizations vs a naive implementation:
+      * one GEMM group per expert (E iterations) instead of n_active x E,
+      * gather/scatter via index_select / index_add_ (no overlapping in-place
+        autograd writes, no per-(k,e) boolean .any() host syncs),
+      * gate weights computed from the *raw* logits; the balancing bias only
+        affects which experts are selected (DeepSeek-V3 design).
 
-    Cost reduction stack:
-      1. MoE: Only top-K experts active per token → K/N_experts compute
-      2. CDLinear: Each expert uses B× fewer params than dense
-      3. FP8: 2× throughput on H800 tensor cores
-      Combined: Theoretical ~(K/N) × (1/B) × 2 cost reduction
-
-    Parameters
-    ----------
-    dim : int
-        Model dimension.
-    n_experts : int
-        Total number of experts.
-    n_active : int
-        Number of experts activated per token (top-K routing).
-    ffn_mult : float
-        FFN hidden dimension multiplier.
-    block : int
-        CD polygon multiplicity for expert weights.
+    For multi-GPU expert parallelism + FP8 dispatch, route this through
+    DeepEP + DeepGEMM grouped GEMM in production.
     """
 
     def __init__(self, dim: int, n_experts: int = 64,
                  n_active: int = 6, ffn_mult: float = 2.667,
-                 block: int = 5, use_fp8: bool = True):
+                 block: int = 5, use_fp8: bool = True,
+                 bias_update_speed: float = 1e-3, impl: str = "matmul"):
         super().__init__()
         self.dim = dim
         self.n_experts = n_experts
-        self.n_active = n_active
-        self.hidden_dim = int(dim * ffn_mult)
-        # Round hidden_dim to multiple of block
-        self.hidden_dim = ((self.hidden_dim + block - 1) // block) * block
+        self.n_active = min(n_active, n_experts)
+        # Speed used by the EXTERNAL updater (see update_router_biases); the
+        # forward pass itself never mutates router state so it stays
+        # deterministic under activation checkpointing.
+        self.bias_update_speed = bias_update_speed
 
-        # Router: dense projection to expert scores
+        hidden = int(dim * ffn_mult)
+        self.hidden_dim = ((hidden + block - 1) // block) * block
+
         self.gate = nn.Linear(dim, n_experts, bias=False)
 
-        # Expert networks: gate + up + down with CDLinear
-        # Each expert: gate_proj (dim -> hidden), up_proj (dim -> hidden),
-        #              down_proj (hidden -> dim)
-        # Using nn.ModuleList for per-expert CDLinear
-        self.gate_proj = nn.ModuleList([
-            CDLinear(dim, self.hidden_dim, block=block, use_fp8=use_fp8)
-            for _ in range(n_experts)
-        ])
-        self.up_proj = nn.ModuleList([
-            CDLinear(dim, self.hidden_dim, block=block, use_fp8=use_fp8)
-            for _ in range(n_experts)
-        ])
-        self.down_proj = nn.ModuleList([
-            CDLinear(self.hidden_dim, dim, block=block, use_fp8=use_fp8)
-            for _ in range(n_experts)
-        ])
+        self.gate_proj = nn.ModuleList(
+            [CDLinear(dim, self.hidden_dim, block=block, use_fp8=use_fp8, impl=impl) for _ in range(n_experts)])
+        self.up_proj = nn.ModuleList(
+            [CDLinear(dim, self.hidden_dim, block=block, use_fp8=use_fp8, impl=impl) for _ in range(n_experts)])
+        self.down_proj = nn.ModuleList(
+            [CDLinear(self.hidden_dim, dim, block=block, use_fp8=use_fp8, impl=impl) for _ in range(n_experts)])
 
         # Shared expert (always active, DeepSeek-V3 style)
-        self.shared_gate = CDLinear(dim, self.hidden_dim, block=block, use_fp8=use_fp8)
-        self.shared_up = CDLinear(dim, self.hidden_dim, block=block, use_fp8=use_fp8)
-        self.shared_down = CDLinear(self.hidden_dim, dim, block=block, use_fp8=use_fp8)
+        self.shared_gate = CDLinear(dim, self.hidden_dim, block=block, use_fp8=use_fp8, impl=impl)
+        self.shared_up = CDLinear(dim, self.hidden_dim, block=block, use_fp8=use_fp8, impl=impl)
+        self.shared_down = CDLinear(self.hidden_dim, dim, block=block, use_fp8=use_fp8, impl=impl)
 
-        # Auxiliary-loss-free load balancing (DeepSeek-V3 innovation)
-        # Uses bias terms instead of auxiliary loss
-        self.expert_bias = nn.Parameter(torch.zeros(n_experts))
+        # Auxiliary-loss-free load-balancing bias (selection only; not learned
+        # by backprop). Updated BETWEEN steps by update_router_biases(), never
+        # inside forward, so forward/recompute stay identical.
+        self.register_buffer('expert_bias', torch.zeros(n_experts))
+        # Most recent per-expert load (idempotent under checkpoint recompute).
+        self.register_buffer('last_load', torch.zeros(n_experts))
 
-    def _route(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Top-K routing with auxiliary-loss-free balancing."""
-        # x: (batch * seq, dim)
-        logits = self.gate(x)  # (N, n_experts)
-
-        # Add bias for load balancing (not used in loss, only for routing)
-        routing_logits = logits + self.expert_bias
-
-        # Top-K selection
-        topk_vals, topk_ids = torch.topk(routing_logits, self.n_active, dim=-1)
-        topk_weights = F.softmax(topk_vals, dim=-1)
-
-        return topk_weights, topk_ids, logits
+    def _expert_ffn(self, idx: int, tokens: torch.Tensor) -> torch.Tensor:
+        return self.down_proj[idx](F.silu(self.gate_proj[idx](tokens)) * self.up_proj[idx](tokens))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (batch, seq_len, dim) -> (batch, seq_len, dim)"""
         orig_shape = x.shape
-        x_flat = x.reshape(-1, self.dim)  # (N, dim)
+        x_flat = x.reshape(-1, self.dim)                         # (N, dim)
         N = x_flat.shape[0]
 
-        # Route tokens to experts
-        topk_weights, topk_ids, _ = self._route(x_flat)
+        logits = self.gate(x_flat.float())                       # (N, E)
+        routing = logits + self.expert_bias                      # bias = selection only
+        topk_val, topk_idx = routing.topk(self.n_active, dim=-1)  # (N, k)
 
-        # Shared expert contribution (always active)
-        shared_out = self.shared_down(
+        # Combine weights come from the RAW logits (bias excluded).
+        sel_logits = torch.gather(logits, 1, topk_idx)           # (N, k)
+        weights = sel_logits.softmax(dim=-1).to(x.dtype)         # (N, k)
+
+        # Shared expert (always on)
+        out = self.shared_down(
             F.silu(self.shared_gate(x_flat)) * self.shared_up(x_flat)
         )
 
-        # Expert computation
-        expert_out = torch.zeros_like(x_flat)
-        for k in range(self.n_active):
-            expert_idx = topk_ids[:, k]  # (N,)
-            weight = topk_weights[:, k]  # (N,)
+        # Grouped dispatch. Sort the (token, slot) assignments by expert ONCE so
+        # each expert consumes a contiguous slice -- this replaces E full boolean
+        # scans (each O(N*k)) and E tensor allocations with a single argsort and
+        # cheap slicing, and a single host sync for the per-expert counts. The
+        # math is identical to the per-expert loop (verified to <1e-5).
+        flat_expert = topk_idx.reshape(-1)                       # (N*k,)
+        flat_weight = weights.reshape(-1, 1)                     # (N*k, 1)
+        token_ids = torch.arange(N, device=x.device).repeat_interleave(self.n_active)
 
-            for e in range(self.n_experts):
-                token_mask = (expert_idx == e)
-                if not token_mask.any():
-                    continue
-                tokens = x_flat[token_mask]
-                # SwiGLU activation (DeepSeek-V3 style)
-                gate_out = F.silu(self.gate_proj[e](tokens))
-                up_out = self.up_proj[e](tokens)
-                e_out = self.down_proj[e](gate_out * up_out)
-                expert_out[token_mask] += weight[token_mask].unsqueeze(-1) * e_out
+        order = torch.argsort(flat_expert)
+        fe, ftok, fw = flat_expert[order], token_ids[order], flat_weight[order]
+        counts = torch.bincount(fe, minlength=self.n_experts).tolist()  # one sync
 
-        output = shared_out + expert_out
-        return output.reshape(orig_shape)
+        start = 0
+        for e in range(self.n_experts):
+            cnt = counts[e]
+            if cnt == 0:
+                continue
+            tok = ftok[start:start + cnt]
+            ye = self._expert_ffn(e, x_flat[tok]) * fw[start:start + cnt].to(x.dtype)
+            out = out.index_add(0, tok, ye.to(out.dtype))
+            start += cnt
+
+        # Stash load for the external balancer. copy_ writes the SAME value on
+        # checkpoint recompute (routing is deterministic here), so it is safe.
+        if self.training:
+            with torch.no_grad():
+                load = torch.bincount(flat_expert, minlength=self.n_experts).float()
+                self.last_load.copy_(load)
+
+        return out.reshape(orig_shape)
 
 
 # =============================================================================
-# 6. CDTransformerBlock — Full transformer block
+# 6. CDTransformerBlock
 # =============================================================================
 class CDTransformerBlock(nn.Module):
-    """Transformer block combining CD-MLA attention + CD-MoE FFN.
-
-    This is the building block for the full CD-Transformer model,
-    combining all cost-reduction techniques:
-      - CDLinear projections in attention (B× compression)
-      - MLA for KV cache compression
-      - MoE with CDLinear experts
-      - Shannon dropout for principled regularization
-      - RMSNorm (DeepSeek-V3 style)
-    """
+    """Pre-norm transformer block: CD-MLA attention + CD-MoE FFN."""
 
     def __init__(self, dim: int, n_heads: int = 16,
                  kv_lora_rank: int = 512,
                  n_experts: int = 64, n_active: int = 6,
                  block: int = 5, max_seq_len: int = 4096,
-                 use_fp8: bool = True):
+                 use_fp8: bool = True, impl: str = "matmul"):
         super().__init__()
         self.attn_norm = RMSNorm(dim)
         self.attn = CDAttention(
-            dim=dim, n_heads=n_heads,
-            kv_lora_rank=kv_lora_rank,
-            block=block, max_seq_len=max_seq_len
+            dim=dim, n_heads=n_heads, kv_lora_rank=kv_lora_rank,
+            block=block, max_seq_len=max_seq_len, use_fp8=use_fp8, impl=impl,
         )
         self.ffn_norm = RMSNorm(dim)
         self.ffn = CDMoELayer(
-            dim=dim, n_experts=n_experts,
-            n_active=n_active, block=block,
-            use_fp8=use_fp8
+            dim=dim, n_experts=n_experts, n_active=n_active,
+            block=block, use_fp8=use_fp8, impl=impl,
         )
         self.dropout = ShannonDropout(ALPHA_CD)
 
     def forward(self, x: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Pre-norm attention with residual
-        h = x + self.dropout(self.attn(self.attn_norm(x), mask=mask))
-        # Pre-norm MoE FFN with residual
+                mask: Optional[torch.Tensor] = None,
+                is_causal: bool = True) -> torch.Tensor:
+        h = x + self.dropout(self.attn(self.attn_norm(x), mask=mask, is_causal=is_causal))
         out = h + self.dropout(self.ffn(self.ffn_norm(h)))
         return out
 
 
 # =============================================================================
-# 7. Fisher Information Regularizer (closed-form for circulant)
+# Auxiliary-loss-free load balancing — called once per OPTIMIZER step,
+# OUTSIDE the (possibly checkpointed) forward pass.
 # =============================================================================
-def fisher_reg_loss(model: nn.Module, lambda_F: float = 1e-4) -> torch.Tensor:
-    """Compute Fisher-information regularization for all CDLinear layers.
+@torch.no_grad()
+def update_router_biases(model: nn.Module) -> None:
+    """Nudge each CDMoELayer's expert_bias against overloaded experts
+    (DeepSeek-V3 auxiliary-loss-free balancing). Safe to call after
+    optimizer.step(); does not touch autograd or the checkpointed graph."""
+    for m in model.modules():
+        if isinstance(m, CDMoELayer) and m.bias_update_speed > 0:
+            load = m.last_load
+            if load.sum() == 0:
+                continue
+            err = load - load.mean()
+            m.expert_bias.add_(-m.bias_update_speed * err.sign())
 
-    For a circulant block C with first row c, the FFT-diagonal singular
-    values are σ_k = |FFT(c)[k]|. A perfectly conditioned layer (Theorem 2,
-    Pan 2026) has a *flat* spectrum: all σ_k equal, i.e. κ = 1.
 
-    We penalize the variance of the log-spectrum, which is:
-      - zero exactly when the spectrum is flat (κ = 1, the optimum),
-      - differentiable w.r.t. the circulant coefficients c (gradient flows),
-      - numerically bounded (unlike Σ 1/σ², which explodes for tiny σ_k).
+# =============================================================================
+# 7. Fisher Information Regularizer (closed-form, differentiable, FSDP-safe)
+# =============================================================================
+def fisher_reg_loss(model: nn.Module, lambda_F: float = 1e-4,
+                    mode: str = "energy", agg: str = "mean",
+                    p: float = 4.0) -> torch.Tensor:
+    """Regularizer over the CD layers.
+
+    mode="energy" (default): L = lambda * sum_layers sum_k |FFT(c)|^2, via the
+        Parseval identity sum_k |FFT(c)|^2 = B*||c||^2. Controls the SUM of
+        Hessian eigenvalues (scale) — effectively L2; keep lambda tiny (~1e-8).
+
+    mode="conditioning": flattens each circulant block's spectrum (paper Eq. 9)
+        and drives kappa -> 1 (Theorem 2). Block penalties are combined by ``agg``:
+          - "mean"  : average over blocks (gentle; can dilute the worst blocks).
+          - "pnorm" : (mean(L_b^p))^(1/p) — smooth emphasis on the worst blocks
+                      (p ~ 4-8); use when a few catastrophic blocks keep
+                      mean/worst kappa high while best-block kappa already falls.
+          - "max"   : the single worst block (most aggressive on the tail).
+        Natural lambda ~1e-2..1e-1.
+
+    Dense (baseline) layers contribute nothing (their c is None).
     """
-    reg = torch.tensor(0.0, device=next(model.parameters()).device)
-    n = 0
-    for module in model.modules():
-        if isinstance(module, CDLinear):
-            c_fft = torch.fft.fft(module.c, dim=-1)
-            sigma2 = (c_fft.real.pow(2) + c_fft.imag.pow(2)).clamp(min=1e-8)
-            log_spec = 0.5 * torch.log(sigma2)
-            reg = reg + log_spec.var(unbiased=False)
-            n += 1
-    if n > 0:
-        reg = reg / n
-    return lambda_F * reg
+    mods = [m for m in model.modules()
+            if isinstance(m, CDLinear) and m.c is not None]
+    if not mods:
+        return torch.zeros((), device=next(model.parameters()).device)
+    if mode == "conditioning":
+        if agg == "mean":
+            return lambda_F * torch.stack([m.spectral_flatness_penalty()
+                                           for m in mods]).mean()
+        blocks = torch.cat([m.spectral_flatness_blocks() for m in mods])
+        if agg == "max":
+            return lambda_F * blocks.max()
+        return lambda_F * blocks.pow(p).mean().pow(1.0 / p)   # generalized p-mean
+    return lambda_F * torch.stack([m.fft_energy() for m in mods]).sum()
 
 
 # =============================================================================
@@ -578,44 +589,34 @@ if __name__ == "__main__":
     print("=" * 60)
     print("CD-NN PyTorch Layers: Smoke Test")
     print("=" * 60)
-
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
 
-    # Test CDLinear
     print("\n[1] CDLinear (128 -> 256, block=5)...")
     layer = CDLinear(128, 256, block=5).to(device)
     x = torch.randn(4, 128, device=device)
     y = layer(x)
-    print(f"    Input: {x.shape} -> Output: {y.shape}")
-    print(f"    Params: {layer.c.numel()}, Compression: {layer.compression_ratio:.1f}×")
-    print(f"    Hessian κ: {layer.condition_number():.2f}")
+    print(f"    {tuple(x.shape)} -> {tuple(y.shape)} | "
+          f"params={layer.c.numel()} | compression={layer.compression_ratio:.1f}x | "
+          f"kappa={layer.condition_number():.2f}")
 
-    # Test CDAttention
     print("\n[2] CDAttention (dim=512, heads=8, kv_rank=128)...")
     attn = CDAttention(512, n_heads=8, kv_lora_rank=128, block=5).to(device)
     x = torch.randn(2, 32, 512, device=device)
-    y = attn(x)
-    print(f"    Input: {x.shape} -> Output: {y.shape}")
+    print(f"    {tuple(x.shape)} -> {tuple(attn(x).shape)}")
 
-    # Test CDMoELayer
     print("\n[3] CDMoELayer (dim=512, 8 experts, top-2)...")
     moe = CDMoELayer(512, n_experts=8, n_active=2, block=5).to(device)
     x = torch.randn(2, 32, 512, device=device)
-    y = moe(x)
-    print(f"    Input: {x.shape} -> Output: {y.shape}")
+    print(f"    {tuple(x.shape)} -> {tuple(moe(x).shape)}")
 
-    # Test CDTransformerBlock
     print("\n[4] CDTransformerBlock...")
-    block = CDTransformerBlock(
-        dim=512, n_heads=8, kv_lora_rank=128,
-        n_experts=8, n_active=2, block=5
-    ).to(device)
+    blk = CDTransformerBlock(dim=512, n_heads=8, kv_lora_rank=128,
+                             n_experts=8, n_active=2, block=5).to(device)
     x = torch.randn(2, 32, 512, device=device)
-    y = block(x)
-    print(f"    Input: {x.shape} -> Output: {y.shape}")
-
-    total_params = sum(p.numel() for p in block.parameters())
-    print(f"    Total block params: {total_params:,}")
+    y = blk(x)
+    y.sum().backward()
+    print(f"    {tuple(x.shape)} -> {tuple(y.shape)} | backward OK | "
+          f"params={sum(p.numel() for p in blk.parameters()):,}")
 
     print("\nAll smoke tests passed.")
